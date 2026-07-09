@@ -10,19 +10,19 @@ def make_service(tmp_path: Path, max_upload_bytes: int = 20) -> LocalStorageServ
     return LocalStorageService(tmp_path / "private", max_upload_bytes)
 
 
-def test_save_read_exists_and_delete_bytes(tmp_path: Path) -> None:
+def test_save_read_and_delete_bytes(tmp_path: Path) -> None:
     service = make_service(tmp_path)
     object_key = "workspaces/1/documents/2/original/file.txt"
 
     saved_key = service.save_bytes(object_key, b"hello")
 
     assert saved_key == object_key
-    assert service.exists(object_key) is True
     assert service.read_bytes(object_key) == b"hello"
 
     service.delete(object_key)
 
-    assert service.exists(object_key) is False
+    with pytest.raises(NotFoundException):
+        service.read_bytes(object_key)
 
 
 def test_save_rejects_empty_or_oversized_content(tmp_path: Path) -> None:

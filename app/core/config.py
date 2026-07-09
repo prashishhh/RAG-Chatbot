@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     jwt_refresh_token_expire_days: int = 30
     refresh_token_bytes: int = 32
     log_level: str = "INFO"
-    storage_provider: str = "local"
     storage_local_root: Path = Path("local_storage/private")
     storage_max_upload_bytes: int = 10 * 1024 * 1024
     storage_allowed_extensions: list[str] = Field(default_factory=lambda: [".pdf", ".txt", ".md"])
@@ -53,9 +52,6 @@ class Settings(BaseSettings):
 
         if not self.is_local and len(jwt_secret) < MIN_NON_LOCAL_JWT_SECRET_LENGTH:
             raise ValueError("JWT_SECRET_KEY must be at least 32 characters outside local/test.")
-
-        if self.storage_provider != "local":
-            raise ValueError("Only local storage provider is supported right now.")
 
         if not str(self.storage_local_root).strip():
             raise ValueError("STORAGE_LOCAL_ROOT must not be empty.")

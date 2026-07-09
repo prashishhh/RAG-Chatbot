@@ -32,16 +32,10 @@ def test_production_accepts_strong_jwt_secret() -> None:
 def test_storage_defaults_are_local_private() -> None:
     settings = Settings()
 
-    assert settings.storage_provider == "local"
     assert str(settings.storage_local_root) == "local_storage/private"
     assert settings.storage_max_upload_bytes == 10 * 1024 * 1024
     assert ".pdf" in settings.storage_allowed_extensions
     assert "application/pdf" in settings.storage_allowed_mime_types
-
-
-def test_storage_rejects_unsupported_provider() -> None:
-    with pytest.raises(ValidationError, match="Only local storage provider"):
-        Settings(storage_provider="s3")
 
 
 def test_storage_rejects_invalid_limits() -> None:

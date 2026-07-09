@@ -27,9 +27,6 @@ class LocalStorageService:
         except FileNotFoundError as exc:
             raise NotFoundException("Storage object not found.") from exc
 
-    def exists(self, object_key: str) -> bool:
-        return self._path_for_key(object_key).is_file()
-
     def delete(self, object_key: str) -> None:
         path = self._path_for_key(object_key)
         try:
