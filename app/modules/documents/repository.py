@@ -4,7 +4,12 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
+from app.modules.documents.models import (
+    ChunkEmbeddingStatus,
+    Document,
+    DocumentChunk,
+    DocumentStatus,
+)
 from app.modules.ingestion.chunking import PreparedChunk
 
 
@@ -98,6 +103,61 @@ class DocumentRepository:
         for chunk in result.scalars().all():
             await self.db.delete(chunk)
         await self.db.flush()
+
+    async def list_chunks_needing_embeddings(
+        self,
+        workspace_id: UUID,
+        document_id: UUID,
+    ) -> list[DocumentChunk]:
+        result = await self.db.execute(
+            select(DocumentChunk)
+            .where(
+                DocumentChunk.workspace_id == workspace_id,
+                DocumentChunk.document_id == document_id,
+                DocumentChunk.embedding_status.in_(
+                    [ChunkEmbeddingStatus.PENDING, ChunkEmbeddingStatus.FAILED]
+                ),
+            )
+            .order_by(DocumentChunk.chunk_index)
+            .with_for_update(skip_locked=True)
+        )
+        return list(result.scalars().all())
+
+    async def mark_chunks_embedding_processing(
+        self,
+        chunks: list[DocumentChunk],
+    ) -> list[DocumentChunk]:
+        for chunk in chunks:
+            chunk.embedding_status = ChunkEmbeddingStatus.PROCESSING
+            chunk.embedding_error = None
+        await self.db.flush()
+        return chunks
+
+    async def mark_chunks_embedding_ready(
+        self,
+        chunk_vectors: list[tuple[DocumentChunk, list[float]]],
+    ) -> list[DocumentChunk]:
+        now = datetime.now(UTC)
+        chunks: list[DocumentChunk] = []
+        for chunk, vector in chunk_vectors:
+            chunk.embedding = vector
+            chunk.embedding_status = ChunkEmbeddingStatus.READY
+            chunk.embedded_at = now
+            chunk.embedding_error = None
+            chunks.append(chunk)
+        await self.db.flush()
+        return chunks
+
+    async def mark_chunks_embedding_failed(
+        self,
+        chunks: list[DocumentChunk],
+        error: str,
+    ) -> list[DocumentChunk]:
+        for chunk in chunks:
+            chunk.embedding_status = ChunkEmbeddingStatus.FAILED
+            chunk.embedding_error = error[:500]
+        await self.db.flush()
+        return chunks
 
     async def soft_delete(self, document: Document) -> Document:
         document.status = DocumentStatus.DELETED

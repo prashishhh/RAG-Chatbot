@@ -47,3 +47,11 @@ class IngestDocumentResponse(BaseModel):
     ingestion_completed_at: datetime | None = Field(alias="ingestionCompletedAt")
 
     model_config = ConfigDict(populate_by_name=True)
+
+
+class EmbedDocumentResponse(BaseModel):
+    document_id: UUID = Field(alias="documentId")
+    status: DocumentStatus
+    embedded_chunk_count: int = Field(alias="embeddedChunkCount", ge=0)
+
+    model_config = ConfigDict(populate_by_name=True)

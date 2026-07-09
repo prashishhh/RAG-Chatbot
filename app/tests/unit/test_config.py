@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.core.config import Settings
+from app.core.config import EMBEDDING_VECTOR_DIMENSION, Settings
 
 
 def test_local_environment_allows_placeholder_jwt_secret() -> None:
@@ -49,3 +49,27 @@ def test_storage_rejects_empty_allowlists() -> None:
 
     with pytest.raises(ValidationError, match="STORAGE_ALLOWED_MIME_TYPES"):
         Settings(storage_allowed_mime_types=[])
+
+
+def test_embedding_defaults_use_ollama() -> None:
+    settings = Settings()
+
+    assert settings.embedding_model == "nomic-embed-text"
+    assert EMBEDDING_VECTOR_DIMENSION == 768
+    assert settings.embedding_batch_size == 16
+    assert settings.ollama_base_url == "http://localhost:11434"
+    assert settings.ollama_timeout_seconds == 30.0
+
+
+def test_embedding_rejects_invalid_settings() -> None:
+    with pytest.raises(ValidationError, match="EMBEDDING_MODEL"):
+        Settings(embedding_model="")
+
+    with pytest.raises(ValidationError, match="EMBEDDING_BATCH_SIZE"):
+        Settings(embedding_batch_size=0)
+
+    with pytest.raises(ValidationError, match="OLLAMA_BASE_URL"):
+        Settings(ollama_base_url="localhost:11434")
+
+    with pytest.raises(ValidationError, match="OLLAMA_TIMEOUT_SECONDS"):
+        Settings(ollama_timeout_seconds=0)

@@ -7,12 +7,18 @@ import pytest
 from app.core.config import Settings
 from app.core.exceptions import (
     ConflictException,
+    ExternalProviderException,
     ForbiddenException,
     NotFoundException,
     ValidationException,
 )
 from app.modules.auth.models import User
-from app.modules.documents.models import Document, DocumentStatus
+from app.modules.documents.models import (
+    ChunkEmbeddingStatus,
+    Document,
+    DocumentChunk,
+    DocumentStatus,
+)
 from app.modules.documents.service import DocumentService
 from app.modules.workspaces.models import Workspace, WorkspaceMember, WorkspaceRole
 
@@ -20,6 +26,7 @@ from app.modules.workspaces.models import Workspace, WorkspaceMember, WorkspaceR
 class FakeDocumentRepository:
     def __init__(self, *, fail_create: bool = False) -> None:
         self.documents: dict[tuple[UUID, UUID], Document] = {}
+        self.chunks: dict[tuple[UUID, UUID], list[DocumentChunk]] = {}
         self.replaced_chunks: list = []
         self.fail_create = fail_create
 
@@ -79,6 +86,50 @@ class FakeDocumentRepository:
         self.replaced_chunks = list(chunks)
         return self.replaced_chunks
 
+    async def list_chunks_needing_embeddings(
+        self,
+        workspace_id: UUID,
+        document_id: UUID,
+    ) -> list[DocumentChunk]:
+        return [
+            chunk
+            for chunk in self.chunks.get((workspace_id, document_id), [])
+            if chunk.embedding_status
+            in {ChunkEmbeddingStatus.PENDING, ChunkEmbeddingStatus.FAILED}
+        ]
+
+    async def mark_chunks_embedding_processing(
+        self,
+        chunks: list[DocumentChunk],
+    ) -> list[DocumentChunk]:
+        for chunk in chunks:
+            chunk.embedding_status = ChunkEmbeddingStatus.PROCESSING
+            chunk.embedding_error = None
+        return chunks
+
+    async def mark_chunks_embedding_ready(
+        self,
+        chunk_vectors: list[tuple[DocumentChunk, list[float]]],
+    ) -> list[DocumentChunk]:
+        rows = []
+        for chunk, vector in chunk_vectors:
+            chunk.embedding = vector
+            chunk.embedding_status = ChunkEmbeddingStatus.READY
+            chunk.embedded_at = datetime.now(UTC)
+            chunk.embedding_error = None
+            rows.append(chunk)
+        return rows
+
+    async def mark_chunks_embedding_failed(
+        self,
+        chunks: list[DocumentChunk],
+        error: str,
+    ) -> list[DocumentChunk]:
+        for chunk in chunks:
+            chunk.embedding_status = ChunkEmbeddingStatus.FAILED
+            chunk.embedding_error = error[:500]
+        return chunks
+
 
 class FakeWorkspaceRepository:
     def __init__(self) -> None:
@@ -107,6 +158,24 @@ class FakeStorageService:
     def delete(self, object_key: str) -> None:
         self.deleted_keys.append(object_key)
         self.objects.pop(object_key, None)
+
+
+class FakeEmbeddingProvider:
+    def __init__(
+        self,
+        *,
+        vectors: list[list[float]] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self.vectors = vectors or [[0.1]]
+        self.error = error
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.calls.append(texts)
+        if self.error is not None:
+            raise self.error
+        return self.vectors[: len(texts)]
 
 
 def make_user(*, is_active: bool = True) -> User:
@@ -163,10 +232,24 @@ def make_document(workspace_id: UUID, user_id: UUID) -> Document:
     )
 
 
+def make_chunk(document: Document, chunk_index: int = 0) -> DocumentChunk:
+    return DocumentChunk(
+        id=uuid4(),
+        workspace_id=document.workspace_id,
+        document_id=document.id,
+        chunk_index=chunk_index,
+        content=f"chunk {chunk_index}",
+        content_hash="a" * 64,
+        char_count=7,
+        embedding_status=ChunkEmbeddingStatus.PENDING,
+    )
+
+
 def make_service(
     workspace_repository: FakeWorkspaceRepository,
     document_repository: FakeDocumentRepository | None = None,
     storage_service: FakeStorageService | None = None,
+    embedding_provider: FakeEmbeddingProvider | None = None,
 ) -> tuple[DocumentService, FakeDocumentRepository, FakeStorageService]:
     documents = document_repository or FakeDocumentRepository()
     storage = storage_service or FakeStorageService()
@@ -175,6 +258,7 @@ def make_service(
         workspace_repository,  # type: ignore[arg-type]
         storage,  # type: ignore[arg-type]
         Settings(app_env="test"),
+        embedding_provider,  # type: ignore[arg-type]
     )
     return service, documents, storage
 
@@ -450,5 +534,143 @@ def test_ingest_marks_failed_on_safe_extraction_error() -> None:
         assert document.ingestion_completed_at is not None
         assert document.ingestion_error == "Document text could not be decoded."
         assert documents.replaced_chunks == []
+
+    asyncio.run(run_test())
+
+
+def test_embed_document_success_for_member() -> None:
+    async def run_test() -> None:
+        workspace_repository = FakeWorkspaceRepository()
+        user = make_user()
+        workspace = make_workspace(user.id)
+        workspace_repository.workspaces[workspace.id] = workspace
+        add_member(workspace_repository, workspace, user, WorkspaceRole.MEMBER)
+        provider = FakeEmbeddingProvider(vectors=[[0.1], [0.2]])
+        service, documents, _ = make_service(workspace_repository, embedding_provider=provider)
+        document = make_document(workspace.id, user.id)
+        document.status = DocumentStatus.READY
+        chunks = [make_chunk(document, 0), make_chunk(document, 1)]
+        documents.documents[(workspace.id, document.id)] = document
+        documents.chunks[(workspace.id, document.id)] = chunks
+
+        response = await service.embed_async(workspace.id, document.id, user)
+
+        assert response.data is not None
+        assert response.data.document_id == document.id
+        assert response.data.embedded_chunk_count == 2
+        assert provider.calls == [["chunk 0", "chunk 1"]]
+        assert chunks[0].embedding == [0.1]
+        assert chunks[1].embedding == [0.2]
+        assert all(chunk.embedding_status == ChunkEmbeddingStatus.READY for chunk in chunks)
+
+    asyncio.run(run_test())
+
+
+def test_embed_document_batches_provider_calls() -> None:
+    async def run_test() -> None:
+        workspace_repository = FakeWorkspaceRepository()
+        user = make_user()
+        workspace = make_workspace(user.id)
+        workspace_repository.workspaces[workspace.id] = workspace
+        add_member(workspace_repository, workspace, user, WorkspaceRole.MEMBER)
+        provider = FakeEmbeddingProvider(vectors=[[0.1]])
+        service, documents, _ = make_service(workspace_repository, embedding_provider=provider)
+        service.settings.embedding_batch_size = 1
+        document = make_document(workspace.id, user.id)
+        document.status = DocumentStatus.READY
+        chunks = [make_chunk(document, 0), make_chunk(document, 1)]
+        documents.documents[(workspace.id, document.id)] = document
+        documents.chunks[(workspace.id, document.id)] = chunks
+
+        response = await service.embed_async(workspace.id, document.id, user)
+
+        assert response.data is not None
+        assert response.data.embedded_chunk_count == 2
+        assert provider.calls == [["chunk 0"], ["chunk 1"]]
+
+    asyncio.run(run_test())
+
+
+def test_embed_requires_member_or_above() -> None:
+    async def run_test() -> None:
+        workspace_repository = FakeWorkspaceRepository()
+        user = make_user()
+        workspace = make_workspace(user.id)
+        workspace_repository.workspaces[workspace.id] = workspace
+        add_member(workspace_repository, workspace, user, WorkspaceRole.VIEWER)
+        service, documents, _ = make_service(workspace_repository)
+        document = make_document(workspace.id, user.id)
+        document.status = DocumentStatus.READY
+        documents.documents[(workspace.id, document.id)] = document
+
+        with pytest.raises(ForbiddenException):
+            await service.embed_async(workspace.id, document.id, user)
+
+    asyncio.run(run_test())
+
+
+def test_embed_requires_ready_document() -> None:
+    async def run_test() -> None:
+        workspace_repository = FakeWorkspaceRepository()
+        user = make_user()
+        workspace = make_workspace(user.id)
+        workspace_repository.workspaces[workspace.id] = workspace
+        add_member(workspace_repository, workspace, user, WorkspaceRole.ADMIN)
+        service, documents, _ = make_service(workspace_repository)
+        document = make_document(workspace.id, user.id)
+        documents.documents[(workspace.id, document.id)] = document
+
+        with pytest.raises(ConflictException):
+            await service.embed_async(workspace.id, document.id, user)
+
+    asyncio.run(run_test())
+
+
+def test_embed_returns_zero_when_chunks_are_already_embedded() -> None:
+    async def run_test() -> None:
+        workspace_repository = FakeWorkspaceRepository()
+        user = make_user()
+        workspace = make_workspace(user.id)
+        workspace_repository.workspaces[workspace.id] = workspace
+        add_member(workspace_repository, workspace, user, WorkspaceRole.ADMIN)
+        provider = FakeEmbeddingProvider()
+        service, documents, _ = make_service(workspace_repository, embedding_provider=provider)
+        document = make_document(workspace.id, user.id)
+        document.status = DocumentStatus.READY
+        documents.documents[(workspace.id, document.id)] = document
+
+        response = await service.embed_async(workspace.id, document.id, user)
+
+        assert response.data is not None
+        assert response.data.embedded_chunk_count == 0
+        assert provider.calls == []
+
+    asyncio.run(run_test())
+
+
+def test_embed_marks_chunks_failed_on_provider_error_without_raw_text() -> None:
+    async def run_test() -> None:
+        workspace_repository = FakeWorkspaceRepository()
+        user = make_user()
+        workspace = make_workspace(user.id)
+        workspace_repository.workspaces[workspace.id] = workspace
+        add_member(workspace_repository, workspace, user, WorkspaceRole.ADMIN)
+        provider = FakeEmbeddingProvider(
+            error=ExternalProviderException("Embedding provider is unavailable.")
+        )
+        service, documents, _ = make_service(workspace_repository, embedding_provider=provider)
+        document = make_document(workspace.id, user.id)
+        document.status = DocumentStatus.READY
+        chunk = make_chunk(document)
+        chunk.content = "raw private chunk text"
+        documents.documents[(workspace.id, document.id)] = document
+        documents.chunks[(workspace.id, document.id)] = [chunk]
+
+        with pytest.raises(ExternalProviderException):
+            await service.embed_async(workspace.id, document.id, user)
+
+        assert chunk.embedding_status == ChunkEmbeddingStatus.FAILED
+        assert chunk.embedding_error == "Embedding provider is unavailable."
+        assert "raw private chunk text" not in (chunk.embedding_error or "")
 
     asyncio.run(run_test())

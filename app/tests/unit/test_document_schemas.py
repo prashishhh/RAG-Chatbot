@@ -6,6 +6,7 @@ from app.modules.documents.schemas import (
     DeleteDocumentResponse,
     DocumentListItemResponse,
     DocumentResponse,
+    EmbedDocumentResponse,
     IngestDocumentResponse,
 )
 
@@ -94,3 +95,18 @@ def test_ingest_document_response_exposes_no_chunks_or_storage_metadata() -> Non
     assert "chunks" not in payload
     assert "objectKey" not in payload
     assert "localPath" not in payload
+
+
+def test_embed_document_response_exposes_no_vectors_or_content() -> None:
+    response = EmbedDocumentResponse(
+        documentId=uuid4(),
+        status=DocumentStatus.READY,
+        embeddedChunkCount=2,
+    )
+
+    payload = response.model_dump(by_alias=True)
+
+    assert set(payload) == {"documentId", "status", "embeddedChunkCount"}
+    assert "embedding" not in payload
+    assert "vector" not in payload
+    assert "content" not in payload

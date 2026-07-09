@@ -2,10 +2,12 @@ from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID as PostgresUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.config import EMBEDDING_VECTOR_DIMENSION
 from app.db.base import Base, TimestampMixin, UuidPrimaryKeyMixin
 from app.modules.auth.models import User
 from app.modules.workspaces.models import Workspace
@@ -18,6 +20,13 @@ class DocumentStatus(StrEnum):
     READY = "Ready"
     FAILED = "Failed"
     DELETED = "Deleted"
+
+
+class ChunkEmbeddingStatus(StrEnum):
+    PENDING = "Pending"
+    PROCESSING = "Processing"
+    READY = "Ready"
+    FAILED = "Failed"
 
 
 class Document(UuidPrimaryKeyMixin, TimestampMixin, Base):
@@ -75,10 +84,15 @@ class DocumentChunk(UuidPrimaryKeyMixin, TimestampMixin, Base):
         CheckConstraint("chunk_index >= 0", name="ck_document_chunks_chunk_index_non_negative"),
         CheckConstraint("char_count > 0", name="ck_document_chunks_char_count_positive"),
         CheckConstraint("length(content_hash) = 64", name="ck_document_chunks_hash_length"),
+        CheckConstraint(
+            "embedding_status IN ('Pending', 'Processing', 'Ready', 'Failed')",
+            name="ck_document_chunks_embedding_status",
+        ),
         Index("ix_document_chunks_workspace_id", "workspace_id"),
         Index("ix_document_chunks_document_id", "document_id"),
         Index("ix_document_chunks_document_index", "document_id", "chunk_index", unique=True),
         Index("ix_document_chunks_workspace_hash", "workspace_id", "content_hash"),
+        Index("ix_document_chunks_workspace_embedding_status", "workspace_id", "embedding_status"),
     )
 
     workspace_id: Mapped[UUID] = mapped_column(
@@ -97,6 +111,15 @@ class DocumentChunk(UuidPrimaryKeyMixin, TimestampMixin, Base):
     char_count: Mapped[int] = mapped_column(Integer, nullable=False)
     page_number: Mapped[int | None] = mapped_column(Integer)
     section_title: Mapped[str | None] = mapped_column(String(255))
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_VECTOR_DIMENSION))
+    embedding_status: Mapped[ChunkEmbeddingStatus] = mapped_column(
+        String(20),
+        default=ChunkEmbeddingStatus.PENDING,
+        server_default=ChunkEmbeddingStatus.PENDING.value,
+        nullable=False,
+    )
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    embedding_error: Mapped[str | None] = mapped_column(String(500))
 
     workspace: Mapped[Workspace] = relationship(foreign_keys=[workspace_id])
     document: Mapped[Document] = relationship(back_populates="chunks", foreign_keys=[document_id])

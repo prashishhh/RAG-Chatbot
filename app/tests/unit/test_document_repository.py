@@ -4,7 +4,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.core.responses import ApiResponse
-from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
+from app.modules.documents.models import (
+    ChunkEmbeddingStatus,
+    Document,
+    DocumentChunk,
+    DocumentStatus,
+)
 from app.modules.documents.repository import DocumentRepository
 from app.modules.ingestion.chunking import PreparedChunk
 
@@ -62,6 +67,17 @@ def make_document() -> Document:
         status=DocumentStatus.UPLOADED,
         created_at=datetime(2026, 7, 8, tzinfo=UTC),
         updated_at=datetime(2026, 7, 8, tzinfo=UTC),
+    )
+
+
+def make_chunk(document: Document, chunk_index: int = 0) -> DocumentChunk:
+    return DocumentChunk(
+        workspace_id=document.workspace_id,
+        document_id=document.id,
+        chunk_index=chunk_index,
+        content="chunk",
+        content_hash="a" * 64,
+        char_count=5,
     )
 
 
@@ -222,6 +238,76 @@ def test_soft_delete_marks_deleted_and_flushes() -> None:
 
         assert result.status == DocumentStatus.DELETED
         assert result.deleted_at is not None
+        assert session.flush_count == 1
+
+    asyncio.run(run_test())
+
+
+def test_list_chunks_needing_embeddings_returns_workspace_scoped_chunks() -> None:
+    async def run_test() -> None:
+        document = make_document()
+        chunk = make_chunk(document)
+        session = FakeSession(execute_result=FakeResult(rows=[chunk]))
+        repository = DocumentRepository(session)  # type: ignore[arg-type]
+
+        result = await repository.list_chunks_needing_embeddings(document.workspace_id, document.id)
+
+        assert result == [chunk]
+        assert len(session.executed) == 1
+
+    asyncio.run(run_test())
+
+
+def test_mark_chunks_embedding_processing_clears_error_and_flushes() -> None:
+    async def run_test() -> None:
+        session = FakeSession()
+        repository = DocumentRepository(session)  # type: ignore[arg-type]
+        document = make_document()
+        chunk = make_chunk(document)
+        chunk.embedding_error = "old"
+
+        result = await repository.mark_chunks_embedding_processing([chunk])
+
+        assert result == [chunk]
+        assert chunk.embedding_status == ChunkEmbeddingStatus.PROCESSING
+        assert chunk.embedding_error is None
+        assert session.flush_count == 1
+
+    asyncio.run(run_test())
+
+
+def test_mark_chunks_embedding_ready_stores_vectors_and_safe_state() -> None:
+    async def run_test() -> None:
+        session = FakeSession()
+        repository = DocumentRepository(session)  # type: ignore[arg-type]
+        document = make_document()
+        chunk = make_chunk(document)
+        vector = [0.1, 0.2]
+
+        result = await repository.mark_chunks_embedding_ready([(chunk, vector)])
+
+        assert result == [chunk]
+        assert chunk.embedding == vector
+        assert chunk.embedding_status == ChunkEmbeddingStatus.READY
+        assert chunk.embedded_at is not None
+        assert chunk.embedding_error is None
+        assert session.flush_count == 1
+
+    asyncio.run(run_test())
+
+
+def test_mark_chunks_embedding_failed_truncates_safe_error() -> None:
+    async def run_test() -> None:
+        session = FakeSession()
+        repository = DocumentRepository(session)  # type: ignore[arg-type]
+        document = make_document()
+        chunk = make_chunk(document)
+
+        result = await repository.mark_chunks_embedding_failed([chunk], "x" * 600)
+
+        assert result == [chunk]
+        assert chunk.embedding_status == ChunkEmbeddingStatus.FAILED
+        assert chunk.embedding_error == "x" * 500
         assert session.flush_count == 1
 
     asyncio.run(run_test())

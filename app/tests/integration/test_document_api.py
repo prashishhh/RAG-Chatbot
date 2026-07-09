@@ -17,6 +17,7 @@ from app.modules.documents.schemas import (
     DeleteDocumentResponse,
     DocumentListItemResponse,
     DocumentResponse,
+    EmbedDocumentResponse,
     IngestDocumentResponse,
 )
 from app.tests.conftest import auth_settings
@@ -106,6 +107,18 @@ class FakeDocumentService:
                 textCharCount=250,
                 ingestionStartedAt=datetime(2026, 7, 8, tzinfo=UTC),
                 ingestionCompletedAt=datetime(2026, 7, 8, tzinfo=UTC),
+            ),
+        )
+
+    async def embed_async(self, workspace_id, document_id, current_user):
+        if document_id != self.document_id:
+            raise NotFoundException("Document not found.")
+        return ApiResponse.success_response(
+            message="Document embedded successfully.",
+            data=EmbedDocumentResponse(
+                documentId=document_id,
+                status=DocumentStatus.READY,
+                embeddedChunkCount=2,
             ),
         )
 
@@ -199,6 +212,18 @@ def test_ingest_document_requires_authentication() -> None:
 
     response = client.post(
         f"/api/v1/workspaces/{service.workspace_id}/documents/{service.document_id}/ingest"
+    )
+
+    assert response.status_code == 401
+
+
+def test_embed_document_requires_authentication() -> None:
+    service = FakeDocumentService()
+    app.dependency_overrides[get_document_service] = lambda: service
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/v1/workspaces/{service.workspace_id}/documents/{service.document_id}/embed"
     )
 
     assert response.status_code == 401
@@ -318,12 +343,43 @@ def test_ingest_document_success() -> None:
     assert "content" not in body["data"]
 
 
+def test_embed_document_success_hides_vectors_and_content() -> None:
+    service = FakeDocumentService()
+    client = authenticated_client()
+    app.dependency_overrides[get_document_service] = lambda: service
+
+    response = client.post(
+        f"/api/v1/workspaces/{service.workspace_id}/documents/{service.document_id}/embed"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"] == "Document embedded successfully."
+    assert body["data"]["documentId"] == str(service.document_id)
+    assert body["data"]["status"] == "Ready"
+    assert body["data"]["embeddedChunkCount"] == 2
+    assert "embedding" not in body["data"]
+    assert "vector" not in body["data"]
+    assert "content" not in body["data"]
+
+
 def test_ingest_document_hides_missing_document() -> None:
     service = FakeDocumentService()
     client = authenticated_client()
     app.dependency_overrides[get_document_service] = lambda: service
 
     response = client.post(f"/api/v1/workspaces/{service.workspace_id}/documents/{uuid4()}/ingest")
+
+    assert response.status_code == 404
+    assert response.json()["message"] == "Document not found."
+
+
+def test_embed_document_hides_missing_document() -> None:
+    service = FakeDocumentService()
+    client = authenticated_client()
+    app.dependency_overrides[get_document_service] = lambda: service
+
+    response = client.post(f"/api/v1/workspaces/{service.workspace_id}/documents/{uuid4()}/embed")
 
     assert response.status_code == 404
     assert response.json()["message"] == "Document not found."

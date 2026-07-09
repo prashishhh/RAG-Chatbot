@@ -3,20 +3,23 @@ from uuid import UUID, uuid4
 from app.core.config import Settings
 from app.core.exceptions import (
     ConflictException,
+    ExternalProviderException,
     ForbiddenException,
     NotFoundException,
     ValidationException,
 )
 from app.core.responses import ApiResponse
 from app.modules.auth.models import User
-from app.modules.documents.models import Document, DocumentStatus
+from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.repository import DocumentRepository
 from app.modules.documents.schemas import (
     DeleteDocumentResponse,
     DocumentListItemResponse,
     DocumentResponse,
+    EmbedDocumentResponse,
     IngestDocumentResponse,
 )
+from app.modules.embeddings.provider import OllamaEmbeddingProvider
 from app.modules.ingestion.chunking import prepare_chunks
 from app.modules.ingestion.extraction import extract_text
 from app.modules.storage.security import (
@@ -35,9 +38,11 @@ DOCUMENT_NOT_FOUND_MESSAGE = "Document not found."
 DOCUMENT_UPLOAD_DENIED_MESSAGE = "You do not have permission to upload documents."
 DOCUMENT_DELETE_DENIED_MESSAGE = "You do not have permission to delete documents."
 DOCUMENT_INGEST_DENIED_MESSAGE = "You do not have permission to ingest documents."
+DOCUMENT_EMBED_DENIED_MESSAGE = "You do not have permission to embed documents."
 DOCUMENT_UPLOAD_ROLES = {WorkspaceRole.OWNER, WorkspaceRole.ADMIN, WorkspaceRole.MEMBER}
 DOCUMENT_DELETE_ROLES = {WorkspaceRole.OWNER, WorkspaceRole.ADMIN}
 DOCUMENT_INGEST_ROLES = {WorkspaceRole.OWNER, WorkspaceRole.ADMIN, WorkspaceRole.MEMBER}
+DOCUMENT_EMBED_ROLES = {WorkspaceRole.OWNER, WorkspaceRole.ADMIN, WorkspaceRole.MEMBER}
 
 
 class DocumentService:
@@ -47,11 +52,13 @@ class DocumentService:
         workspace_repository: WorkspaceRepository,
         storage_service: LocalStorageService,
         settings: Settings,
+        embedding_provider: OllamaEmbeddingProvider | None = None,
     ) -> None:
         self.document_repository = document_repository
         self.workspace_repository = workspace_repository
         self.storage_service = storage_service
         self.settings = settings
+        self.embedding_provider = embedding_provider or OllamaEmbeddingProvider(settings)
 
     async def upload_async(
         self,
@@ -201,6 +208,73 @@ class DocumentService:
                 ingestionCompletedAt=document.ingestion_completed_at,
             ),
         )
+
+    async def embed_async(
+        self,
+        workspace_id: UUID,
+        document_id: UUID,
+        current_user: User,
+    ) -> ApiResponse[EmbedDocumentResponse]:
+        member = await self._get_active_workspace_member(workspace_id, current_user)
+        if member.role not in DOCUMENT_EMBED_ROLES:
+            raise ForbiddenException(DOCUMENT_EMBED_DENIED_MESSAGE)
+
+        document = await self.document_repository.get_document_by_id(workspace_id, document_id)
+        if document is None:
+            raise NotFoundException(DOCUMENT_NOT_FOUND_MESSAGE)
+        if document.status != DocumentStatus.READY:
+            raise ConflictException("Document must be ingested before embedding.")
+
+        chunks = await self.document_repository.list_chunks_needing_embeddings(
+            workspace_id,
+            document_id,
+        )
+        if not chunks:
+            return ApiResponse.success_response(
+                message="Document embeddings are already up to date.",
+                data=EmbedDocumentResponse(
+                    documentId=document.id,
+                    status=document.status,
+                    embeddedChunkCount=0,
+                ),
+            )
+
+        await self.document_repository.mark_chunks_embedding_processing(chunks)
+
+        try:
+            embedded_count = await self._embed_chunks(chunks)
+        except ExternalProviderException as exc:
+            await self.document_repository.mark_chunks_embedding_failed(chunks, exc.message)
+            raise
+        except Exception:
+            await self.document_repository.mark_chunks_embedding_failed(
+                chunks,
+                "Document embedding failed.",
+            )
+            raise
+
+        return ApiResponse.success_response(
+            message="Document embedded successfully.",
+            data=EmbedDocumentResponse(
+                documentId=document.id,
+                status=document.status,
+                embeddedChunkCount=embedded_count,
+            ),
+        )
+
+    async def _embed_chunks(self, chunks: list[DocumentChunk]) -> int:
+        embedded_count = 0
+        batch_size = self.settings.embedding_batch_size
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start : start + batch_size]
+            vectors = await self.embedding_provider.embed_texts([chunk.content for chunk in batch])
+            if len(vectors) != len(batch):
+                raise ExternalProviderException("Embedding provider returned invalid embeddings.")
+            await self.document_repository.mark_chunks_embedding_ready(
+                list(zip(batch, vectors, strict=True))
+            )
+            embedded_count += len(batch)
+        return embedded_count
 
     async def _get_active_workspace_member(
         self,

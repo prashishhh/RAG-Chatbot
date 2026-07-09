@@ -12,6 +12,7 @@ from app.modules.documents.schemas import (
     DeleteDocumentResponse,
     DocumentListItemResponse,
     DocumentResponse,
+    EmbedDocumentResponse,
     IngestDocumentResponse,
 )
 from app.modules.documents.service import DocumentService
@@ -78,6 +79,16 @@ async def ingest_document(
     service: Annotated[DocumentService, Depends(get_document_service)],
 ) -> ApiResponse[IngestDocumentResponse]:
     return await service.ingest_async(workspace_id, document_id, current_user)
+
+
+@router.post("/{document_id}/embed", response_model=ApiResponse[EmbedDocumentResponse])
+async def embed_document(
+    workspace_id: UUID,
+    document_id: UUID,
+    current_user: Annotated[User, Depends(require_active_user)],
+    service: Annotated[DocumentService, Depends(get_document_service)],
+) -> ApiResponse[EmbedDocumentResponse]:
+    return await service.embed_async(workspace_id, document_id, current_user)
 
 
 async def _read_upload(file: UploadFile, max_upload_bytes: int) -> bytes:

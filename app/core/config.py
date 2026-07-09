@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # This exact placeholder is allowed only for local/test and rejected elsewhere.
 LOCAL_JWT_SECRET_PLACEHOLDER = "change-this-in-local-env"  # noqa: S105
 MIN_NON_LOCAL_JWT_SECRET_LENGTH = 32
+EMBEDDING_VECTOR_DIMENSION = 768
 
 
 class Settings(BaseSettings):
@@ -38,6 +39,10 @@ class Settings(BaseSettings):
     storage_allowed_mime_types: list[str] = Field(
         default_factory=lambda: ["application/pdf", "text/plain", "text/markdown"]
     )
+    embedding_model: str = "nomic-embed-text"
+    embedding_batch_size: int = 16
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_timeout_seconds: float = 30.0
 
     @property
     def is_local(self) -> bool:
@@ -64,6 +69,18 @@ class Settings(BaseSettings):
 
         if not self.storage_allowed_mime_types:
             raise ValueError("STORAGE_ALLOWED_MIME_TYPES must not be empty.")
+
+        if not self.embedding_model.strip():
+            raise ValueError("EMBEDDING_MODEL must not be empty.")
+
+        if self.embedding_batch_size <= 0:
+            raise ValueError("EMBEDDING_BATCH_SIZE must be greater than 0.")
+
+        if not self.ollama_base_url.startswith(("http://", "https://")):
+            raise ValueError("OLLAMA_BASE_URL must start with http:// or https://.")
+
+        if self.ollama_timeout_seconds <= 0:
+            raise ValueError("OLLAMA_TIMEOUT_SECONDS must be greater than 0.")
 
         return self
 
